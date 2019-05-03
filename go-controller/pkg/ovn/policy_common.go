@@ -2,13 +2,15 @@ package ovn
 
 import (
 	"fmt"
-	"github.com/openvswitch/ovn-kubernetes/go-controller/pkg/factory"
-	"github.com/openvswitch/ovn-kubernetes/go-controller/pkg/util"
-	"github.com/sirupsen/logrus"
-	knet "k8s.io/api/networking/v1"
 	"net"
 	"sort"
 	"sync"
+
+	"github.com/TomCodeLV/OVSDB-golang-lib/pkg/dbtransaction"
+	"github.com/TomCodeLV/OVSDB-golang-lib/pkg/helpers"
+	"github.com/openvswitch/ovn-kubernetes/go-controller/pkg/factory"
+	"github.com/sirupsen/logrus"
+	knet "k8s.io/api/networking/v1"
 )
 
 type namespacePolicy struct {
@@ -169,28 +171,39 @@ const (
 	// Default deny acl rule priority
 	defaultDenyPriority = "1000"
 	// Default allow acl rule priority
-	defaultAllowPriority = "1001"
+	defaultAllowPriority    = "1001"
+	defaultAllowPriorityInt = 1001
 	// IP Block except deny acl rule priority
 	ipBlockDenyPriority = "1010"
 )
 
-func (oc *Controller) addAllowACLFromNode(logicalSwitch string) error {
-	subnet, stderr, err := util.RunOVNNbctl("get", "logical_switch",
-		logicalSwitch, "other-config:subnet")
-	if err != nil {
-		logrus.Errorf("failed to get the logical_switch %s subnet, "+
-			"stderr: %q (%v)", logicalSwitch, stderr, err)
-		return err
+func (oc *Controller) addAllowACLFromNode(logicalSwitchName string) {
+	acls := oc.ovnNbCache.GetMap("ACL", "uuid")
+	uuid := oc.getACLUUIDFromMap(acls, map[string]interface{}{
+		"external_ids": map[string]string{
+			"logical_switch": logicalSwitchName,
+			"node-acl":       "yes",
+		},
+	})
+
+	if uuid != "" {
+		return
 	}
 
-	if subnet == "" {
-		return fmt.Errorf("logical_switch %q had no subnet", logicalSwitch)
+	logicalSwitch := oc.ovnNbCache.GetMap("Logical_Switch", "name", logicalSwitchName)
+	if logicalSwitch == nil || logicalSwitch["other_config"] == nil {
+		return
 	}
 
-	ip, _, err := net.ParseCIDR(subnet)
+	subnet := logicalSwitch["other_config"].(map[string]interface{})["subnet"]
+	if subnet == nil {
+		return
+	}
+
+	ip, _, err := net.ParseCIDR(subnet.(string))
 	if err != nil {
 		logrus.Errorf("failed to parse subnet %s", subnet)
-		return err
+		return
 	}
 
 	// K8s only supports IPv4 right now. The second IP address of the
@@ -199,15 +212,38 @@ func (oc *Controller) addAllowACLFromNode(logicalSwitch string) error {
 	ip[3] = ip[3] + 2
 	address := ip.String()
 
-	match := fmt.Sprintf("ip4.src==%s", address)
-	_, stderr, err = util.RunOVNNbctl("--may-exist", "acl-add", logicalSwitch,
-		"to-lport", defaultAllowPriority, match, "allow-related")
-	if err != nil {
-		logrus.Errorf("failed to create the node acl for "+
-			"logical_switch=%s, stderr: %q (%v)", logicalSwitch, stderr, err)
+	match := fmt.Sprintf("ip4.src == %s", address)
+
+	retry := true
+	for retry {
+		txn := oc.ovnNBDB.Transaction("OVN_Northbound")
+		newACLID := txn.Insert(dbtransaction.Insert{
+			Table: "ACL",
+			Row: map[string]interface{}{
+				"priority":  defaultAllowPriorityInt,
+				"direction": "to-lport",
+				"match":     match,
+				"action":    "allow-related",
+				"external_ids": helpers.MakeOVSDBMap(map[string]interface{}{
+					"logical_switch": logicalSwitchName,
+					"node-acl":       "yes",
+				}),
+			},
+		})
+		txn.InsertReferences(dbtransaction.InsertReferences{
+			Table:           "Logical_Switch",
+			WhereId:         logicalSwitch["uuid"].(string),
+			ReferenceColumn: "acls",
+			InsertIdsList:   []string{newACLID},
+			Wait:            true,
+			Cache:           oc.ovnNbCache,
+		})
+		_, err, retry = txn.Commit()
 	}
 
-	return err
+	if err != nil {
+		logrus.Errorf("failed to create the node acl for logical_switch=%s (%v)", logicalSwitchName, err)
+	}
 }
 
 func (oc *Controller) syncNetworkPolicies(networkPolicies []interface{}) {

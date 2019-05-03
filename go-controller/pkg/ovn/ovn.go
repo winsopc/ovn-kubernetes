@@ -1,6 +1,13 @@
 package ovn
 
 import (
+	"reflect"
+	"strings"
+	"sync"
+
+	"github.com/TomCodeLV/OVSDB-golang-lib/pkg/dbcache"
+	"github.com/TomCodeLV/OVSDB-golang-lib/pkg/ovsdb"
+	"github.com/openvswitch/ovn-kubernetes/go-controller/pkg/config"
 	"github.com/openvswitch/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/openvswitch/ovn-kubernetes/go-controller/pkg/kube"
 	util "github.com/openvswitch/ovn-kubernetes/go-controller/pkg/util"
@@ -9,8 +16,6 @@ import (
 	kapisnetworking "k8s.io/api/networking/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"reflect"
-	"sync"
 )
 
 // Controller structure is the object which holds the controls for starting
@@ -72,6 +77,12 @@ type Controller struct {
 
 	// supports port_group?
 	portGroupSupport bool
+
+	// NB database handle
+	ovnNBDB *ovsdb.OVSDB
+
+	// NB database cache handle
+	ovnNbCache *dbcache.Cache
 }
 
 const (
@@ -82,9 +93,97 @@ const (
 	UDP = "UDP"
 )
 
+// dialNB dials into NorthBound database. Initialize callback creates a cache where
+// all required data will be available for later use.
+func dialNB() (*ovsdb.OVSDB, *dbcache.Cache) {
+	var addrList [][]string
+
+	addresses := strings.Split(config.OvnNorth.Address,
+		",")
+
+	var options map[string]interface{}
+	var useSSL bool
+	for _, address := range addresses {
+		addr := strings.SplitN(address, ":", 2)
+
+		if addr[0] == "ssl" {
+			addr = append(addr, config.OvnNorth.Cert)
+			addr = append(addr, config.OvnNorth.PrivKey)
+			addr = append(addr, config.OvnNorth.CACert)
+
+			useSSL = true
+
+		}
+		addrList = append(addrList, addr)
+	}
+
+	if useSSL {
+		options = map[string]interface{}{
+			"ServerName":         "ovnnb id:ac380054-0a6b-4a3c-9f2d-16a9eb55a89f",
+			"InsecureSkipVerify": true,
+		}
+	}
+
+	nbCache := new(dbcache.Cache)
+	db := ovsdb.Dial(addrList, func(db *ovsdb.OVSDB) error {
+		// initialize cache
+		tmpCache, err := db.Cache(ovsdb.Cache{
+			Schema: "OVN_Northbound",
+			Tables: map[string][]string{
+				"Logical_Switch":      {"_uuid", "name", "ports", "acls", "external_ids", "other_config"},
+				"Logical_Switch_Port": {"_uuid", "name", "external_ids", "addresses", "dynamic_addresses"},
+				"ACL":            {"_uuid", "external_ids", "match", "action"},
+				"Address_Set":    {"_uuid", "name", "external_ids"},
+				"Port_Group":     {"_uuid", "name", "acls", "ports"},
+				"Load_Balancer":  {"_uuid", "vips", "protocol", "external_ids"},
+				"Logical_Router": {"_uuid", "name", "options", "external_ids"},
+			},
+			Indexes: map[string][]string{
+				"Logical_Switch_Port": {"name"},
+				"Logical_Switch":      {"name"},
+				"Address_Set":         {"name"},
+				"Logical_Router":      {"name"},
+				"Port_Group":          {"name"},
+			},
+		})
+
+		// fallback for older version
+		if err != nil && err.Error() == "syntax error: no table named Port_Group ()" {
+			tmpCache, err = db.Cache(ovsdb.Cache{
+				Schema: "OVN_Northbound",
+				Tables: map[string][]string{
+					"Logical_Switch":      {"_uuid", "name", "ports", "acls", "external_ids", "other_config"},
+					"Logical_Switch_Port": {"_uuid", "name", "external_ids", "addresses", "dynamic_addresses"},
+					"ACL":            {"_uuid", "external_ids", "match", "action"},
+					"Address_Set":    {"_uuid", "name", "external_ids"},
+					"Load_Balancer":  {"_uuid", "vips", "protocol", "external_ids"},
+					"Logical_Router": {"_uuid", "name", "options", "external_ids"},
+				},
+				Indexes: map[string][]string{
+					"Logical_Switch_Port": {"name"},
+					"Logical_Switch":      {"name"},
+					"Address_Set":         {"name"},
+					"Logical_Router":      {"name"},
+				},
+			})
+		}
+
+		if err == nil {
+			*nbCache = *tmpCache
+			return nil
+		}
+
+		logrus.Errorf("Error in NB cache: %v", err)
+		return err
+	}, options)
+
+	return db, nbCache
+}
+
 // NewOvnController creates a new OVN controller for creating logical network
 // infrastructure and policy
 func NewOvnController(kubeClient kubernetes.Interface, wf *factory.WatchFactory, nodePortEnable bool) *Controller {
+	db, tmpCache := dialNB()
 	return &Controller{
 		kube:                     &kube.Kube{KClient: kubeClient},
 		watchFactory:             wf,
@@ -102,6 +201,8 @@ func NewOvnController(kubeClient kubernetes.Interface, wf *factory.WatchFactory,
 		loadbalancerClusterCache: make(map[string]string),
 		loadbalancerGWCache:      make(map[string]string),
 		nodePortEnable:           nodePortEnable,
+		ovnNBDB:                  db,
+		ovnNbCache:               tmpCache,
 	}
 }
 
