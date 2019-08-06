@@ -3,7 +3,9 @@
 package cni
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -23,6 +25,7 @@ func (s *Server) Start(requestFunc cniRequestFunc) error {
 	}
 	s.requestFunc = requestFunc
 
+	configPath := filepath.Join(s.rundir, serverConfigFileName)
 	socketPath := filepath.Join(s.rundir, serverSocketName)
 
 	// For security reasons the socket must be accessible only to root.
@@ -63,6 +66,16 @@ func (s *Server) Start(requestFunc cniRequestFunc) error {
 	}
 	if err := os.MkdirAll(s.rundir, 0700); err != nil {
 		return fmt.Errorf("failed to create pod info socket directory %s: %v", s.rundir, err)
+	}
+
+	// Write config file
+	shimConfig, err := json.Marshal(s.shimConfig)
+	if err != nil {
+		return fmt.Errorf("could not marshal cniShimConfig data: %v", err)
+	}
+	err = ioutil.WriteFile(configPath, shimConfig, 0400)
+	if err != nil {
+		return fmt.Errorf("could not write config file %q: %v", configPath, err)
 	}
 
 	// On Linux the socket is created with the permissions of the directory

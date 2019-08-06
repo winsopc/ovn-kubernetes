@@ -753,6 +753,7 @@ cleanup-ovn-node () {
   check_ovn_daemonset_version "3"
 
   rm -f /etc/cni/net.d/10-ovn-kubernetes.conf
+  rm -f /var/run/ovn-kubernetes/cni/cniShimConfig.json
 
   echo "=============== time: $(date +%d-%m-%H:%M:%S:%N) cleanup-ovn-node - (wait for ovn-controller to exit)"
   retries=0

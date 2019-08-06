@@ -228,6 +228,9 @@ func runOvnKube(ctx *cli.Context) error {
 				panic("Cannot initialize node without service account 'token'. Please provide one with --k8s-token argument")
 			}
 
+			if ctx.Bool("unprivileged-mode") {
+				config.PrivilegedMode = false
+			}
 			err := clusterController.StartClusterNode(node)
 			if err != nil {
 				logrus.Errorf(err.Error())

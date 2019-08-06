@@ -18,6 +18,7 @@ import (
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
+	"github.com/sirupsen/logrus"
 
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
 )
@@ -26,6 +27,7 @@ import (
 // functions to use it
 type Plugin struct {
 	socketPath string
+	configPath string
 }
 
 // NewCNIPlugin creates the internal Plugin object
@@ -33,7 +35,7 @@ func NewCNIPlugin(socketPath string) *Plugin {
 	if len(socketPath) == 0 {
 		socketPath = serverSocketPath
 	}
-	return &Plugin{socketPath: socketPath}
+	return &Plugin{socketPath: socketPath, configPath: serverConfigFilePath}
 }
 
 // Create and fill a Request with this Plugin's environment and stdin which
@@ -109,9 +111,24 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
-	result, err := current.NewResult(body)
-	if err != nil {
-		return fmt.Errorf("failed to unmarshal response '%s': %v", string(body), err)
+	var result types.Result
+	cniconfig := readConfig(p.configPath)
+	//Currently, unprivileged mode is only supported on Linux.
+	if cniconfig != nil && !cniconfig.CNIServerPrivileged {
+		pr, _ := cniRequestToPodRequest(req)
+		podIntfaceInfo := &PodIntfaceInfo{}
+		if err = json.Unmarshal(body, podIntfaceInfo); err != nil {
+			return fmt.Errorf("Failed to unmarshal response '%s': %v", string(body), err)
+		}
+		result = pr.getCNIResult(podIntfaceInfo)
+		if result == nil {
+			return fmt.Errorf("Failed to get CNI Result from pod interface info %q", podIntfaceInfo)
+		}
+	} else {
+		result, err = current.NewResult(body)
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal response '%s': %v", string(body), err)
+		}
 	}
 
 	return types.PrintResult(result, conf.CNIVersion)
@@ -121,4 +138,18 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 func (p *Plugin) CmdDel(args *skel.CmdArgs) error {
 	_, err := p.doCNI("http://dummy/", newCNIRequest(args))
 	return err
+}
+
+func readConfig(configPath string) *ShimConfig {
+	bytes, err := ioutil.ReadFile(configPath)
+	if err != nil {
+		logrus.Errorf("Failed to read cniShimConfig file %v", err)
+		return nil
+	}
+	var shimConfig ShimConfig
+	if err = json.Unmarshal(bytes, &shimConfig); err != nil {
+		logrus.Errorf("Could not parse cniShimConfig file %q: %v", configPath, err)
+		return nil
+	}
+	return &shimConfig
 }

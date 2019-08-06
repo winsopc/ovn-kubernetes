@@ -50,6 +50,9 @@ func NewCNIServer(rundir string) *Server {
 			Handler: router,
 		},
 		rundir: rundir,
+		shimConfig: ShimConfig{
+			CNIServerPrivileged: config.PrivilegedMode,
+		},
 	}
 	router.NotFoundHandler = http.HandlerFunc(http.NotFound)
 	router.HandleFunc("/", s.handleCNIRequest).Methods("POST")
@@ -77,12 +80,7 @@ func gatherCNIArgs(env map[string]string) (map[string]string, error) {
 	return mapArgs, nil
 }
 
-func cniRequestToPodRequest(r *http.Request) (*PodRequest, error) {
-	var cr Request
-	b, _ := ioutil.ReadAll(r.Body)
-	if err := json.Unmarshal(b, &cr); err != nil {
-		return nil, fmt.Errorf("JSON unmarshal error: %v", err)
-	}
+func cniRequestToPodRequest(cr *Request) (*PodRequest, error) {
 
 	cmd, ok := cr.Env["CNI_COMMAND"]
 	if !ok {
@@ -134,7 +132,13 @@ func cniRequestToPodRequest(r *http.Request) (*PodRequest, error) {
 // Dispatch a pod request to the request handler and return the result to the
 // CNI server client
 func (s *Server) handleCNIRequest(w http.ResponseWriter, r *http.Request) {
-	req, err := cniRequestToPodRequest(r)
+	var cr Request
+	b, _ := ioutil.ReadAll(r.Body)
+	if err := json.Unmarshal(b, &cr); err != nil {
+		http.Error(w, fmt.Sprintf("%v", err), http.StatusBadRequest)
+		return
+	}
+	req, err := cniRequestToPodRequest(&cr)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("%v", err), http.StatusBadRequest)
 		return
