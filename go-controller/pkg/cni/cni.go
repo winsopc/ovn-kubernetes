@@ -128,13 +128,13 @@ func (pr *PodRequest) cmdAdd() *PodResult {
 		Ingress:    ingress,
 		Egress:     egress}
 	podResult := &PodResult{}
+	response := &Response{}
 	if config.PrivilegedMode {
-		result := pr.getCNIResult(podIntfaceInfo)
-		podResult.Response, _ = json.Marshal(result)
+		response.Result = pr.getCNIResult(podIntfaceInfo)
 	} else {
-		podResult.Response, _ = json.Marshal(podIntfaceInfo)
+		response.PodIFInfo = &podIntfaceInfo
 	}
-
+	podResult.Response, _ = json.Marshal(response)
 	return podResult
 }
 

@@ -50,6 +50,11 @@ type Request struct {
 	// CNI configuration passed via stdin to the CNI plugin
 	Config []byte `json:"config,omitempty"`
 }
+// Response sent to the OVN CNI plugin by the Server
+type Response struct {
+	Result *current.Result
+	PodIFInfo *PodIntfaceInfo
+}
 
 // PodRequest structure built from Request which is passed to the
 // handler function given to the Server at creation time
