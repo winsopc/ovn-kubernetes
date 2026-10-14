@@ -451,7 +451,7 @@ func (bsnc *BaseUserDefinedNetworkController) removePodForUserDefinedNetwork(pod
 
 	var alreadyProcessed bool
 	for nadKey, podAnnotation := range podNetworks {
-		networkName := bsnc.networkManager.GetNetworkNameForNADKey(nadKey)
+		networkName := bsnc.networkNameForNADKey(nadKey)
 		portInfo := portInfoMap[nadKey]
 		if networkName == "" && portInfo != nil {
 			// The NAD may have been deleted before the Pod delete event is
@@ -565,12 +565,21 @@ func (bsnc *BaseUserDefinedNetworkController) syncPodsForUserDefinedNetwork(pods
 			bsnc.networkManager.GetNetworkNameForNADKey,
 			bsnc.networkManager.GetPrimaryNADForNamespace,
 		)
-		if err != nil || !on {
-			if err != nil {
-				bsnc.recordPodErrorEvent(pod, err)
-				klog.Errorf("Failed to determine if pod %s/%s needs to be plumb interface on network %s: %v",
-					pod.Namespace, pod.Name, bsnc.GetNetworkName(), err)
-			}
+		if err != nil {
+			bsnc.recordPodErrorEvent(pod, err)
+			klog.Errorf("Failed to determine if pod %s/%s needs to be plumb interface on network %s: %v",
+				pod.Namespace, pod.Name, bsnc.GetNetworkName(), err)
+			continue
+		}
+		// The running controller leaves the port of a pod alone when its
+		// selection stops listing a NAD of the network (KubeVirt empties it
+		// on VM launchers with SR-IOV interfaces), so keep the localnet ports
+		// that pod-networks still records instead of cutting their datapath
+		// on restart.
+		if bsnc.TopologyType() == types.LocalnetTopology && !util.PodCompleted(pod) {
+			bsnc.expectAnnotatedLogicalPorts(pod, expectedLogicalPorts)
+		}
+		if !on {
 			continue
 		}
 
@@ -608,6 +617,46 @@ func (bsnc *BaseUserDefinedNetworkController) syncPodsForUserDefinedNetwork(pods
 	}
 
 	return bsnc.deleteStaleLogicalSwitchPorts(expectedLogicalPorts)
+}
+
+// expectAnnotatedLogicalPorts marks the logical ports of pod for each NAD key
+// of this network that the pod-networks annotation records.
+func (bsnc *BaseUserDefinedNetworkController) expectAnnotatedLogicalPorts(pod *corev1.Pod, expectedLogicalPorts map[string]bool) {
+	podNetworks, err := util.UnmarshalPodAnnotationAllNetworks(pod.Annotations)
+	if err != nil {
+		klog.Errorf("Failed to get pod-networks of pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		return
+	}
+	for nadKey := range podNetworks {
+		if bsnc.networkNameForNADKey(nadKey) == bsnc.GetNetworkName() {
+			expectedLogicalPorts[bsnc.GetLogicalPortName(pod, nadKey)] = true
+		}
+	}
+}
+
+// nadOfPodNetworksKey returns the NAD of a key of the pod-networks
+// annotation, or "" for the default network's entry, which is not a NAD key.
+// A pod that attaches a NAD more than once records indexed keys (ns/name/1).
+func nadOfPodNetworksKey(key string) (string, error) {
+	if key == types.DefaultNetworkName {
+		return "", nil
+	}
+	nadName, _, err := util.GetNadFromIndexedNADKey(key)
+	return nadName, err
+}
+
+// networkNameForNADKey returns the network of a key of the pod-networks
+// annotation, or "" if it has none.
+func (bsnc *BaseUserDefinedNetworkController) networkNameForNADKey(nadKey string) string {
+	nadName, err := nadOfPodNetworksKey(nadKey)
+	if err != nil {
+		klog.Errorf("Invalid NAD key %q: %v", nadKey, err)
+		return ""
+	}
+	if nadName == "" {
+		return ""
+	}
+	return bsnc.networkManager.GetNetworkNameForNADKey(nadName)
 }
 
 // AddNamespaceForUserDefinedNetwork creates corresponding addressset in ovn db for User Defined Network

@@ -150,8 +150,10 @@ var _ = Describe("Network Segmentation: Localnet", feature.NetworkSegmentation, 
 	// The startup pod sync deletes the logical switch ports it does not expect,
 	// so a restart must keep the port of every running localnet pod: with no
 	// IPAM, ovnkube-node writes the pod annotation; with subnets, the cluster
-	// manager does.
-	DescribeTable("should preserve the LSP of a localnet pod after ovnkube-node restart", func(ctx SpecContext, vlan int, ovsBrName, cidr string) {
+	// manager does. It must also keep the port of a pod whose network selection
+	// was emptied after the pod was wired, as the running controller does;
+	// KubeVirt empties it on VM launchers with SR-IOV interfaces.
+	DescribeTable("should preserve the LSP of a localnet pod after ovnkube-node restart", func(ctx SpecContext, vlan int, ovsBrName, cidr string, emptySelection bool) {
 		var (
 			cudnName            = uniqueMetaName("restart-localnet")
 			physicalNetworkName = uniqueMetaName("physnet-restart")
@@ -262,6 +264,15 @@ var _ = Describe("Network Segmentation: Localnet", feature.NetworkSegmentation, 
 		Expect(err).ToNot(HaveOccurred())
 		Expect(expectedLSP).ToNot(BeEmpty())
 
+		if emptySelection {
+			By("empty the pod's network selection")
+			_, err = e2ekubectl.RunKubectl(f.Namespace.Name, "annotate", "pod", testPod.Name, "--overwrite",
+				nadapi.NetworkAttachmentAnnot+"=")
+			Expect(err).NotTo(HaveOccurred(), "should empty the network selection of pod %s", testPod.Name)
+			Consistently(findLSP).WithTimeout(10*time.Second).WithPolling(2*time.Second).
+				Should(Equal(expectedLSP), "the running controller should keep the LSP after the selection is emptied")
+		}
+
 		By("restart ovnkube-node pod on the node where test pod is running")
 		err = restartOVNKubeNodePod(f.ClientSet, deploymentconfig.Get().OVNKubernetesNamespace(), nodeName)
 		Expect(err).NotTo(HaveOccurred(), "should successfully restart ovnkube-node pod")
@@ -290,8 +301,10 @@ var _ = Describe("Network Segmentation: Localnet", feature.NetworkSegmentation, 
 		_, hasAnnotation := pod.Annotations["k8s.ovn.org/pod-networks"]
 		Expect(hasAnnotation).To(BeTrue(), "pod should still have network annotation")
 	},
-		Entry("with no IPAM", 201, "ovsbr-ipamless", ""),
-		Entry("with subnets", 202, "ovsbr-subnets", joinStrings("192.168.102.0/24", "2001:dbc::/64")),
+		Entry("with no IPAM", 201, "ovsbr-ipamless", "", false),
+		Entry("with subnets", 202, "ovsbr-subnets", joinStrings("192.168.102.0/24", "2001:dbc::/64"), false),
+		Entry("with no IPAM, whose network selection was emptied", 203, "ovsbr-nosel", "", true),
+		Entry("with subnets, whose network selection was emptied", 204, "ovsbr-nosel2", joinStrings("192.168.104.0/24", "2001:dbe::/64"), true),
 	)
 })
 

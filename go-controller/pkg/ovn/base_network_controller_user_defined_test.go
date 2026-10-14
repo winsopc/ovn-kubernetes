@@ -1617,10 +1617,10 @@ var _ = Describe("localnet pod sync at startup", func() {
 		config.OVNKubernetesFeature.EnableMultiNetwork = true
 	})
 
-	// syncPorts runs the startup pod sync of a localnet network whose switch
-	// holds one port of the test pod, listing pod unless it is nil, and
-	// reports whether the port is still there with its original UUID.
-	syncPorts := func(ipam string, pod *corev1.Pod) bool {
+	// startNetwork starts the controller of a localnet network whose switch
+	// holds a port of the test pod for each of portNADKeys, and returns it with
+	// a function that lists those ports by name and UUID.
+	startNetwork := func(ipam string, portNADKeys ...string) (*BaseUserDefinedNetworkController, func() map[string]string) {
 		nad := ovntest.GenerateNADWithConfig(nadName, namespaceName, fmt.Sprintf(`
 {
         "cniVersion": "1.0.0",
@@ -1635,22 +1635,25 @@ var _ = Describe("localnet pod sync at startup", func() {
 		netInfo, err := util.ParseNADInfo(nad)
 		Expect(err).NotTo(HaveOccurred())
 		switchName := netInfo.GetNetworkScopedName(types.OVNLocalnetSwitch)
-		portName := util.GetUserDefinedNetworkLogicalPortName(namespaceName, podName, nadKey)
-		port := &nbdb.LogicalSwitchPort{
-			UUID:        portName + "-UUID",
-			Name:        portName,
-			Addresses:   []string{podMAC},
-			ExternalIDs: map[string]string{"pod": "true", "namespace": namespaceName},
-		}
-		logicalSwitch := &nbdb.LogicalSwitch{
-			UUID:  switchName + "-UUID",
-			Name:  switchName,
-			Ports: []string{port.UUID},
+		logicalSwitch := &nbdb.LogicalSwitch{UUID: switchName + "-UUID", Name: switchName}
+		nbData := []libovsdbtest.TestData{logicalSwitch}
+		portNames := map[string]bool{}
+		for _, key := range portNADKeys {
+			portName := util.GetUserDefinedNetworkLogicalPortName(namespaceName, podName, key)
+			portNames[portName] = true
+			port := &nbdb.LogicalSwitchPort{
+				UUID:        portName + "-UUID",
+				Name:        portName,
+				Addresses:   []string{podMAC},
+				ExternalIDs: map[string]string{"pod": "true", "namespace": namespaceName},
+			}
+			logicalSwitch.Ports = append(logicalSwitch.Ports, port.UUID)
+			nbData = append(nbData, port)
 		}
 
 		fakeOVN := NewFakeOVN(false, nodeName)
 		fakeOVN.startWithDBSetup(
-			libovsdbtest.TestSetup{NBData: []libovsdbtest.TestData{logicalSwitch, port}},
+			libovsdbtest.TestSetup{NBData: nbData},
 			&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}},
 			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespaceName}},
 			&nettypes.NetworkAttachmentDefinitionList{Items: []nettypes.NetworkAttachmentDefinition{*nad}},
@@ -1663,23 +1666,47 @@ var _ = Describe("localnet pod sync at startup", func() {
 			return controller.bnc.networkManager.GetNetworkNameForNADKey(nadKey)
 		}).Should(Equal(networkName))
 
-		findPort := func() []*nbdb.LogicalSwitchPort {
+		findPorts := func() map[string]string {
 			lsps, err := libovsdbops.FindLogicalSwitchPortWithPredicate(fakeOVN.nbClient,
-				func(p *nbdb.LogicalSwitchPort) bool { return p.Name == portName })
+				func(p *nbdb.LogicalSwitchPort) bool { return portNames[p.Name] })
 			Expect(err).NotTo(HaveOccurred())
-			return lsps
+			uuids := map[string]string{}
+			for _, lsp := range lsps {
+				uuids[lsp.Name] = lsp.UUID
+			}
+			return uuids
 		}
-		before := findPort()
-		Expect(before).To(HaveLen(1))
+		Expect(findPorts()).To(HaveLen(len(portNADKeys)))
+		return controller.bnc, findPorts
+	}
+
+	// syncPorts runs the startup pod sync of a localnet network whose switch
+	// holds a port of the test pod for each of portNADKeys (default: nadKey),
+	// listing pod unless it is nil, and reports whether every port is still
+	// there with its original UUID.
+	syncPorts := func(ipam string, pod *corev1.Pod, portNADKeys ...string) bool {
+		if len(portNADKeys) == 0 {
+			portNADKeys = []string{nadKey}
+		}
+		bnc, findPorts := startNetwork(ipam, portNADKeys...)
+		before := findPorts()
 
 		var pods []interface{}
 		if pod != nil {
 			pods = append(pods, pod)
 		}
-		Expect(controller.bnc.syncPodsForUserDefinedNetwork(pods)).To(Succeed())
+		Expect(bnc.syncPodsForUserDefinedNetwork(pods)).To(Succeed())
 
-		after := findPort()
-		return len(after) == 1 && after[0].UUID == before[0].UUID
+		after := findPorts()
+		if len(after) != len(before) {
+			return false
+		}
+		for name, uuid := range before {
+			if after[name] != uuid {
+				return false
+			}
+		}
+		return true
 	}
 
 	newPod := func(selection string) *corev1.Pod {
@@ -1707,10 +1734,18 @@ var _ = Describe("localnet pod sync at startup", func() {
 		Entry("with subnets", subnets, nadKey),
 		// the CNI writes the annotation of a DHCP network
 		Entry("with DHCP", dhcp, nadKey),
+		// KubeVirt empties the selection of VM launchers with SR-IOV
+		// interfaces; the running controller keeps their ports
+		Entry("without IPAM whose selection was emptied", noIPAM, ""),
+		Entry("with DHCP whose selection was emptied", dhcp, ""),
 	)
 
 	completed := newPod(nadKey)
 	completed.Status.Phase = corev1.PodSucceeded
+	withoutPodNetworks := newPod("")
+	delete(withoutPodNetworks.Annotations, types.OvnPodAnnotationName)
+	completedWithoutSelection := newPod("")
+	completedWithoutSelection.Status.Phase = corev1.PodSucceeded
 
 	DescribeTable("deletes the port",
 		func(ipam string, pod *corev1.Pod) {
@@ -1718,6 +1753,57 @@ var _ = Describe("localnet pod sync at startup", func() {
 		},
 		Entry("of a completed pod with subnets", subnets, completed),
 		Entry("of a completed pod with DHCP", dhcp, completed),
+		Entry("of a deleted pod", noIPAM, (*corev1.Pod)(nil)),
+		Entry("of a pod whose selection was emptied without a pod-networks entry", noIPAM, withoutPodNetworks),
+		Entry("of a completed pod whose selection was emptied", noIPAM, completedWithoutSelection),
+	)
+
+	// A pod that attaches the NAD twice records indexed NAD keys
+	// (foo-ns/localnet-nad/1) in pod-networks.
+	secondNADKey := util.GetIndexedNADKey(nadKey, 1)
+	twoAttachments := func(selection string) *corev1.Pod {
+		pod := newPod(selection)
+		pod.Annotations[types.OvnPodAnnotationName] = `{"default":{"ip_addresses":["10.128.0.3/23"],"mac_address":"0a:58:0a:80:00:03","role":"primary"},` +
+			`"foo-ns/localnet-nad":{"ip_addresses":["10.1.192.102/24"],"mac_address":"0a:58:fd:98:00:01","role":"secondary"},` +
+			`"foo-ns/localnet-nad/1":{"ip_addresses":["10.1.192.103/24"],"mac_address":"0a:58:fd:98:00:02","role":"secondary"}}`
+		return pod
+	}
+	DescribeTable("keeps both ports of a running pod that attaches the NAD twice",
+		func(selection string) {
+			Expect(syncPorts(dhcp, twoAttachments(selection), nadKey, secondNADKey)).To(BeTrue())
+		},
+		Entry("whose selection was emptied", ""),
+		// the selection still lists the network, but not the second attachment
+		Entry("whose selection dropped the second attachment", nadKey),
+	)
+
+	It("deletes both ports when the pod that attaches the NAD twice is deleted after a restart", func() {
+		// the add path skips a pod whose selection is empty, so after a
+		// restart no port info is cached for it
+		pod := twoAttachments("")
+		bnc, findPorts := startNetwork(dhcp, nadKey, secondNADKey)
+		Expect(bnc.syncPodsForUserDefinedNetwork([]interface{}{pod})).To(Succeed())
+		Expect(findPorts()).To(HaveLen(2))
+
+		Expect(bnc.removePodForUserDefinedNetwork(pod, bnc.getPortInfoForUserDefinedNetwork(pod))).To(Succeed())
+		Expect(findPorts()).To(BeEmpty())
+	})
+
+	DescribeTable("resolves the NAD of a pod-networks key",
+		func(key, wantNAD string, wantErr bool) {
+			nadName, err := nadOfPodNetworksKey(key)
+			if wantErr {
+				Expect(err).To(HaveOccurred(), "key %q should be rejected", key)
+				return
+			}
+			Expect(err).NotTo(HaveOccurred(), "key %q should be accepted", key)
+			Expect(nadName).To(Equal(wantNAD), "NAD of key %q", key)
+		},
+		// every pod records it; it must not be reported as a malformed key
+		Entry("to none for the default network's entry", types.DefaultNetworkName, "", false),
+		Entry("for a NAD key", nadKey, nadKey, false),
+		Entry("for a repeated attachment", secondNADKey, nadKey, false),
+		Entry("to an error for a malformed key", "foo-ns/localnet-nad/1/2", "", true),
 	)
 })
 
