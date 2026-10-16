@@ -1595,6 +1595,200 @@ var _ = Describe("localnet DHCP IPAM pod lifecycle", func() {
 	})
 })
 
+var _ = Describe("localnet pod sync at startup", func() {
+	const (
+		namespaceName = "foo-ns"
+		nadName       = "localnet-nad"
+		networkName   = "localnet-net"
+		nodeName      = "node1"
+		podName       = "bar-pod"
+		nadKey        = namespaceName + "/" + nadName
+		podMAC        = "0a:58:fd:98:00:01"
+
+		noIPAM  = `"ipam": {}`
+		subnets = `"subnets": "10.1.192.0/24"`
+		dhcp    = `"ipam": {"type": "dhcp"}`
+
+		podNetworks = `{"foo-ns/localnet-nad":{"ip_addresses":["10.1.192.102/24"],"mac_address":"0a:58:fd:98:00:01","role":"secondary"}}`
+	)
+
+	BeforeEach(func() {
+		Expect(config.PrepareTestConfig()).To(Succeed())
+		config.OVNKubernetesFeature.EnableMultiNetwork = true
+	})
+
+	// startNetwork starts the controller of a localnet network whose switch
+	// holds a port of the test pod for each of portNADKeys, and returns it with
+	// a function that lists those ports by name and UUID.
+	startNetwork := func(ipam string, portNADKeys ...string) (*BaseUserDefinedNetworkController, func() map[string]string) {
+		nad := ovntest.GenerateNADWithConfig(nadName, namespaceName, fmt.Sprintf(`
+{
+        "cniVersion": "1.0.0",
+        "name": %q,
+        "type": "ovn-k8s-cni-overlay",
+        "topology": "localnet",
+        "netAttachDefName": %q,
+        %s
+}
+`, networkName, nadKey, ipam))
+		ovntest.AnnotateNADWithNetworkID("3", nad)
+		netInfo, err := util.ParseNADInfo(nad)
+		Expect(err).NotTo(HaveOccurred())
+		switchName := netInfo.GetNetworkScopedName(types.OVNLocalnetSwitch)
+		logicalSwitch := &nbdb.LogicalSwitch{UUID: switchName + "-UUID", Name: switchName}
+		nbData := []libovsdbtest.TestData{logicalSwitch}
+		portNames := map[string]bool{}
+		for _, key := range portNADKeys {
+			portName := util.GetUserDefinedNetworkLogicalPortName(namespaceName, podName, key)
+			portNames[portName] = true
+			port := &nbdb.LogicalSwitchPort{
+				UUID:        portName + "-UUID",
+				Name:        portName,
+				Addresses:   []string{podMAC},
+				ExternalIDs: map[string]string{"pod": "true", "namespace": namespaceName},
+			}
+			logicalSwitch.Ports = append(logicalSwitch.Ports, port.UUID)
+			nbData = append(nbData, port)
+		}
+
+		fakeOVN := NewFakeOVN(false, nodeName)
+		fakeOVN.startWithDBSetup(
+			libovsdbtest.TestSetup{NBData: nbData},
+			&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespaceName}},
+			&nettypes.NetworkAttachmentDefinitionList{Items: []nettypes.NetworkAttachmentDefinition{*nad}},
+		)
+		DeferCleanup(fakeOVN.shutdown)
+		Expect(fakeOVN.NewUserDefinedNetworkController(nad)).To(Succeed())
+		controller, ok := fakeOVN.userDefinedNetworkControllers[networkName]
+		Expect(ok).To(BeTrue())
+		Eventually(func() string {
+			return controller.bnc.networkManager.GetNetworkNameForNADKey(nadKey)
+		}).Should(Equal(networkName))
+
+		findPorts := func() map[string]string {
+			lsps, err := libovsdbops.FindLogicalSwitchPortWithPredicate(fakeOVN.nbClient,
+				func(p *nbdb.LogicalSwitchPort) bool { return portNames[p.Name] })
+			Expect(err).NotTo(HaveOccurred())
+			uuids := map[string]string{}
+			for _, lsp := range lsps {
+				uuids[lsp.Name] = lsp.UUID
+			}
+			return uuids
+		}
+		Expect(findPorts()).To(HaveLen(len(portNADKeys)))
+		return controller.bnc, findPorts
+	}
+
+	// syncPorts runs the startup pod sync of a localnet network whose switch
+	// holds a port of the test pod for each of portNADKeys (default: nadKey),
+	// listing pod unless it is nil, and reports whether every port is still
+	// there with its original UUID.
+	syncPorts := func(ipam string, pod *corev1.Pod, portNADKeys ...string) bool {
+		if len(portNADKeys) == 0 {
+			portNADKeys = []string{nadKey}
+		}
+		bnc, findPorts := startNetwork(ipam, portNADKeys...)
+		before := findPorts()
+
+		var pods []interface{}
+		if pod != nil {
+			pods = append(pods, pod)
+		}
+		Expect(bnc.syncPodsForUserDefinedNetwork(pods)).To(Succeed())
+
+		after := findPorts()
+		if len(after) != len(before) {
+			return false
+		}
+		for name, uuid := range before {
+			if after[name] != uuid {
+				return false
+			}
+		}
+		return true
+	}
+
+	newPod := func(selection string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespaceName,
+				Name:      podName,
+				UID:       podName,
+				Annotations: map[string]string{
+					nettypes.NetworkAttachmentAnnot: selection,
+					types.OvnPodAnnotationName:      podNetworks,
+				},
+			},
+			Spec:   corev1.PodSpec{NodeName: nodeName},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+	}
+
+	DescribeTable("keeps the port of a running pod",
+		func(ipam, selection string) {
+			Expect(syncPorts(ipam, newPod(selection))).To(BeTrue())
+		},
+		Entry("without IPAM", noIPAM, nadKey),
+		// the cluster manager writes the annotation of a subnets network
+		Entry("with subnets", subnets, nadKey),
+		// the CNI writes the annotation of a DHCP network
+		Entry("with DHCP", dhcp, nadKey),
+		// KubeVirt empties the selection of VM launchers with SR-IOV
+		// interfaces; the running controller keeps their ports
+		Entry("without IPAM whose selection was emptied", noIPAM, ""),
+		Entry("with DHCP whose selection was emptied", dhcp, ""),
+	)
+
+	completed := newPod(nadKey)
+	completed.Status.Phase = corev1.PodSucceeded
+	withoutPodNetworks := newPod("")
+	delete(withoutPodNetworks.Annotations, types.OvnPodAnnotationName)
+	completedWithoutSelection := newPod("")
+	completedWithoutSelection.Status.Phase = corev1.PodSucceeded
+
+	DescribeTable("deletes the port",
+		func(ipam string, pod *corev1.Pod) {
+			Expect(syncPorts(ipam, pod)).To(BeFalse())
+		},
+		Entry("of a completed pod with subnets", subnets, completed),
+		Entry("of a completed pod with DHCP", dhcp, completed),
+		Entry("of a deleted pod", noIPAM, (*corev1.Pod)(nil)),
+		Entry("of a pod whose selection was emptied without a pod-networks entry", noIPAM, withoutPodNetworks),
+		Entry("of a completed pod whose selection was emptied", noIPAM, completedWithoutSelection),
+	)
+
+	// A pod that attaches the NAD twice records indexed NAD keys
+	// (foo-ns/localnet-nad/1) in pod-networks.
+	secondNADKey := util.GetIndexedNADKey(nadKey, 1)
+	twoAttachments := func(selection string) *corev1.Pod {
+		pod := newPod(selection)
+		pod.Annotations[types.OvnPodAnnotationName] = `{"foo-ns/localnet-nad":{"ip_addresses":["10.1.192.102/24"],"mac_address":"0a:58:fd:98:00:01","role":"secondary"},` +
+			`"foo-ns/localnet-nad/1":{"ip_addresses":["10.1.192.103/24"],"mac_address":"0a:58:fd:98:00:02","role":"secondary"}}`
+		return pod
+	}
+	DescribeTable("keeps both ports of a running pod that attaches the NAD twice",
+		func(selection string) {
+			Expect(syncPorts(dhcp, twoAttachments(selection), nadKey, secondNADKey)).To(BeTrue())
+		},
+		Entry("whose selection was emptied", ""),
+		// the selection still lists the network, but not the second attachment
+		Entry("whose selection dropped the second attachment", nadKey),
+	)
+
+	It("deletes both ports when the pod that attaches the NAD twice is deleted after a restart", func() {
+		// the add path skips a pod whose selection is empty, so after a
+		// restart no port info is cached for it
+		pod := twoAttachments("")
+		bnc, findPorts := startNetwork(dhcp, nadKey, secondNADKey)
+		Expect(bnc.syncPodsForUserDefinedNetwork([]interface{}{pod})).To(Succeed())
+		Expect(findPorts()).To(HaveLen(2))
+
+		Expect(bnc.removePodForUserDefinedNetwork(pod, bnc.getPortInfoForUserDefinedNetwork(pod))).To(Succeed())
+		Expect(findPorts()).To(BeEmpty())
+	})
+})
+
 // nadKeyNameOverlay keeps GetPrimaryNADForNamespace (and thus namespace-informer
 // NotFound) on the wrapped manager, while allowing tests to claim a NAD key.
 type nadKeyNameOverlay struct {
