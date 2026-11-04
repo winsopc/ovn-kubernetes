@@ -47,6 +47,10 @@ import (
 // administration can lead to undefined behavior if referenced by running pods.
 type nadController struct {
 	sync.RWMutex
+	// syncLock serializes the syncs of NADs, so that the sync of the filtered
+	// NADs on start and the worker cannot apply an older version of a NAD
+	// after a newer one.
+	syncLock sync.Mutex
 	// reconcilers keyed by registration ID.
 	reconcilers      map[uint64]reconcilerRegistration
 	nextReconcilerID uint64
@@ -542,6 +546,11 @@ func (c *nadController) Start() error {
 		}
 	}
 
+	// The trackers only queue the NADs that they made active, and the worker
+	// may not have synced them yet. Sync them now: the network controller
+	// cleans up every network that is not ensured when it starts.
+	c.syncFilteredNADs()
+
 	// NetworkController starts last and starts to process network keys to spin up network controllers.
 	// At this point the tracker cache's are warm to get accurate information for filtering.
 	err = c.networkController.Start()
@@ -998,6 +1007,31 @@ func (c *nadController) syncAll() (err error) {
 	return nil
 }
 
+// syncFilteredNADs syncs the NADs that local Dynamic UDN filtering keeps from
+// being rendered, so that those that became active are rendered. These are the
+// NADs marked for removal and, if their grace period already expired, the NADs
+// removed locally. A NAD that fails to sync is requeued, as the worker would
+// requeue it.
+func (c *nadController) syncFilteredNADs() {
+	ctx := context.Background()
+	if !c.usesLocalDynamicFiltering() {
+		return
+	}
+	c.RLock()
+	keys := make([]string, 0, len(c.markedForRemoval)+c.dynamicallyRemovedNADs.Len())
+	for key := range c.markedForRemoval {
+		keys = append(keys, key)
+	}
+	keys = append(keys, c.dynamicallyRemovedNADs.UnsortedList()...)
+	c.RUnlock()
+	for _, key := range keys {
+		if err := c.sync(ctx, key); err != nil {
+			klog.Errorf("%s: failed to sync %s, requeuing it: %v", c.name, key, err)
+			c.controller.ReconcileRateLimited(key)
+		}
+	}
+}
+
 func (c *nadController) sync(ctx context.Context, key string) error {
 	startTime := time.Now()
 	klog.V(5).Infof("%s: sync NAD %s", c.name, key)
@@ -1011,6 +1045,8 @@ func (c *nadController) sync(ctx context.Context, key string) error {
 		return nil
 	}
 
+	c.syncLock.Lock()
+	defer c.syncLock.Unlock()
 	nad, err := c.nadLister.NetworkAttachmentDefinitions(namespace).Get(name)
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err

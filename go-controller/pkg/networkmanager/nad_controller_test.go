@@ -349,6 +349,47 @@ func TestSyncNAD_ForceDeleteRemovesCacheOnActualDelete(t *testing.T) {
 	g.Expect(c.markedForRemoval).ToNot(gomega.HaveKey(key))
 }
 
+// TestSyncDoesNotOverlap checks that a sync of a NAD reads the NAD only after
+// a sync already running completed. Otherwise the sync of the filtered NADs on
+// start could apply an older version of a NAD after the worker applied a newer
+// one.
+func TestSyncDoesNotOverlap(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	key := "ns/nad"
+	netIDAlloc := id.NewIDAllocator("NetworkIDs", MaxNetworks)
+	g.Expect(netIDAlloc.ReserveID(types.DefaultNetworkName, types.DefaultNetworkID)).To(gomega.Succeed())
+	lister := &blockingNADLister{gets: make(chan string, 2), release: make(chan struct{})}
+	releaseOnce := sync.OnceFunc(func() { close(lister.release) })
+	defer releaseOnce()
+
+	c := &nadController{
+		name:               "test-nad-controller",
+		nads:               map[string]string{},
+		primaryNADs:        map[string]string{},
+		markedForRemoval:   map[string]time.Time{},
+		networkIDAllocator: netIDAlloc,
+		nadLister:          lister,
+		networkController: &networkController{
+			networks:           map[string]util.MutableNetInfo{},
+			networkControllers: map[string]*networkControllerState{},
+		},
+	}
+
+	ctx := context.Background()
+	done := make(chan error, 2)
+	go func() { done <- c.sync(ctx, key) }()
+	g.Eventually(lister.gets).Should(gomega.Receive(gomega.Equal("nad")))
+	go func() { done <- c.sync(ctx, key) }()
+	g.Consistently(lister.gets, 200*time.Millisecond).ShouldNot(gomega.Receive(),
+		"a sync must not read the NAD while another sync runs")
+
+	releaseOnce()
+	g.Eventually(lister.gets).Should(gomega.Receive(gomega.Equal("nad")))
+	g.Eventually(done).Should(gomega.Receive(gomega.BeNil()))
+	g.Eventually(done).Should(gomega.Receive(gomega.BeNil()))
+}
+
 func ptrTo[T any](v T) *T { return &v }
 
 func testNetworkKey(nInfo util.NetInfo) string {
@@ -396,6 +437,29 @@ func (f *fakeNADLister) List(_ labels.Selector) ([]*nettypes.NetworkAttachmentDe
 
 func (f *fakeNADLister) NetworkAttachmentDefinitions(_ string) nadlisters.NetworkAttachmentDefinitionNamespaceLister {
 	return &fakeNADNamespaceLister{nads: f.nads}
+}
+
+// blockingNADLister reports each NAD read on gets and holds it until release
+// is closed.
+type blockingNADLister struct {
+	fakeNADLister
+	gets    chan string
+	release chan struct{}
+}
+
+func (f *blockingNADLister) NetworkAttachmentDefinitions(_ string) nadlisters.NetworkAttachmentDefinitionNamespaceLister {
+	return &blockingNADNamespaceLister{lister: f}
+}
+
+type blockingNADNamespaceLister struct {
+	fakeNADNamespaceLister
+	lister *blockingNADLister
+}
+
+func (f *blockingNADNamespaceLister) Get(name string) (*nettypes.NetworkAttachmentDefinition, error) {
+	f.lister.gets <- name
+	<-f.lister.release
+	return f.fakeNADNamespaceLister.Get(name)
 }
 
 type fakeCNCLister struct {
@@ -3965,4 +4029,212 @@ func TestSyncNADPreservesTunnelKeysAfterSharedNetworkRename(t *testing.T) {
 	}
 	g.Expect(allocated["renamed"][1:]).To(gomega.Equal(oldKeys[1:]))
 	g.Expect(allocated["original"][1]).NotTo(gomega.Equal(allocated["renamed"][1]))
+}
+
+// TestStartStaleNetworkCleanup checks that the stale network
+// cleanup on start keeps a dynamically allocated network that a local pod
+// uses, and only that: the initial NAD sync filters it out because the pod
+// tracker cache is still empty, and the network must be ensured again once the
+// tracker has warmed up. The NAD controller worker is held until the start
+// completes, so only the start itself can ensure the network.
+func TestStartStaleNetworkCleanup(t *testing.T) {
+	const (
+		nodeName  = "test-node"
+		namespace = "test"
+	)
+	tests := []struct {
+		name           string
+		podNode        string
+		removedLocally bool
+		expectKept     bool
+	}{
+		{name: "keeps the network of a local pod", podNode: nodeName, expectKept: true},
+		{
+			// the removal grace period expired before the trackers started
+			name:           "keeps the network of a local pod already removed locally",
+			podNode:        nodeName,
+			removedLocally: true,
+			expectKept:     true,
+		},
+		{name: "cleans up the network of a remote pod", podNode: "other-node"},
+		{name: "cleans up the network without pods"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+
+			g.Expect(config.PrepareTestConfig()).To(gomega.Succeed())
+			config.OVNKubernetesFeature.EnableMultiNetwork = true
+			config.OVNKubernetesFeature.EnableNetworkSegmentation = true
+			config.OVNKubernetesFeature.EnableDynamicUDNAllocation = true
+
+			fakeClient := util.GetOVNClientset().GetOVNKubeControllerClientset()
+			wf, err := factory.NewOVNKubeControllerWatchFactory(fakeClient, nodeName)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			tcm := &testControllerManager{
+				controllers: map[string]NetworkController{},
+				defaultNetwork: &testNetworkController{
+					ReconcilableNetInfo: &util.DefaultNetInfo{},
+				},
+			}
+			nm, err := newController("node-nad-controller", nodeName, tcm, wf, nil, nil, nil, nodeName, false)
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			// hold the worker, as a busy CPU can, until the start completes
+			release := make(chan struct{})
+			nm.controller = controller.NewController(
+				nm.name,
+				&controller.ControllerConfig[nettypes.NetworkAttachmentDefinition]{
+					RateLimiter: workqueue.DefaultTypedControllerRateLimiter[string](),
+					Informer:    wf.NADInformer().Informer(),
+					Lister:      nm.nadLister.List,
+					Reconcile: func(ctx context.Context, key string) error {
+						<-release
+						return nm.sync(ctx, key)
+					},
+					ObjNeedsUpdate: nm.nadNeedsUpdate,
+					Threadiness:    1,
+				},
+			)
+			if tt.removedLocally {
+				nm.dynamicallyRemovedNADs.Insert(util.GetNADName(namespace, "nad1"))
+			}
+
+			ctx := context.Background()
+			for _, node := range []string{nodeName, "other-node"} {
+				_, err = fakeClient.KubeClient.CoreV1().Nodes().Create(ctx,
+					&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: node}}, metav1.CreateOptions{})
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+			}
+			_, err = fakeClient.KubeClient.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   namespace,
+					Labels: map[string]string{types.RequiredUDNNamespaceLabel: ""},
+				},
+			}, metav1.CreateOptions{})
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+
+			netConf := &ovncnitypes.NetConf{
+				Topology: types.Layer3Topology,
+				NetConf: cnitypes.NetConf{
+					Name: "network_A",
+					Type: "ovn-k8s-cni-overlay",
+				},
+				Subnets: "10.1.0.0/16/24",
+				Role:    types.NetworkRolePrimary,
+				MTU:     1400,
+				NADName: util.GetNADName(namespace, "nad1"),
+			}
+			nad, err := buildNADWithAnnotations("nad1", namespace, netConf, map[string]string{
+				types.OvnNetworkNameAnnotation: netConf.Name,
+				types.OvnNetworkIDAnnotation:   "1",
+			})
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			nad.OwnerReferences = []metav1.OwnerReference{{
+				Kind:       "UserDefinedNetwork",
+				Name:       "udn-a",
+				Controller: ptrTo(true),
+			}}
+			_, err = fakeClient.NetworkAttchDefClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(namespace).
+				Create(ctx, nad, metav1.CreateOptions{})
+			g.Expect(err).ToNot(gomega.HaveOccurred())
+			if tt.podNode != "" {
+				_, err = fakeClient.KubeClient.CoreV1().Pods(namespace).Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: namespace},
+					Spec:       corev1.PodSpec{NodeName: tt.podNode},
+					Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+				}, metav1.CreateOptions{})
+				g.Expect(err).ToNot(gomega.HaveOccurred())
+			}
+
+			g.Expect(wf.Start()).To(gomega.Succeed())
+			defer wf.Shutdown()
+			g.Expect(nm.Start()).To(gomega.Succeed())
+			defer nm.Stop()
+			defer close(release)
+
+			tcm.Lock()
+			defer tcm.Unlock()
+			validNetworks := []string{}
+			for _, network := range tcm.valid {
+				validNetworks = append(validNetworks, network.GetNetworkName())
+			}
+			if tt.expectKept {
+				g.Expect(validNetworks).To(gomega.ContainElement(netConf.Name),
+					"the network of a local pod must not be cleaned up as stale on start")
+			} else {
+				g.Expect(validNetworks).ToNot(gomega.ContainElement(netConf.Name),
+					"a network without local pods must be cleaned up as stale on start")
+			}
+		})
+	}
+}
+
+type failingNADLister struct {
+	fakeNADLister
+}
+
+func (f *failingNADLister) NetworkAttachmentDefinitions(_ string) nadlisters.NetworkAttachmentDefinitionNamespaceLister {
+	return &failingNADNamespaceLister{}
+}
+
+type failingNADNamespaceLister struct {
+	fakeNADNamespaceLister
+}
+
+func (f *failingNADNamespaceLister) Get(_ string) (*nettypes.NetworkAttachmentDefinition, error) {
+	return nil, fmt.Errorf("lister failure")
+}
+
+func TestSyncFilteredNADsRequeuesFailedNADs(t *testing.T) {
+	const key = "test/nad1"
+	tests := []struct {
+		name                   string
+		markedForRemoval       map[string]time.Time
+		dynamicallyRemovedNADs sets.Set[string]
+	}{
+		{
+			name:             "of a NAD marked for removal",
+			markedForRemoval: map[string]time.Time{key: time.Now()},
+		},
+		{
+			// the removal grace period expired before the trackers started
+			name:                   "of a NAD already removed locally",
+			markedForRemoval:       map[string]time.Time{},
+			dynamicallyRemovedNADs: sets.New(key),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			reconciled := make(chan string, 10)
+			nadSyncController := controller.NewController(
+				"test-nad-sync-controller-for-filtered-nads",
+				&controller.ControllerConfig[string]{
+					RateLimiter: workqueue.DefaultTypedControllerRateLimiter[string](),
+					Reconcile: func(_ context.Context, key string) error {
+						reconciled <- key
+						return nil
+					},
+					Threadiness: 1,
+				},
+			)
+			g.Expect(controller.Start(nadSyncController)).To(gomega.Succeed())
+			defer controller.Stop(nadSyncController)
+
+			nc := &nadController{
+				controller:             nadSyncController,
+				filterNADsOnNode:       "test-node",
+				nadLister:              &failingNADLister{},
+				markedForRemoval:       tt.markedForRemoval,
+				dynamicallyRemovedNADs: tt.dynamicallyRemovedNADs,
+			}
+			// the sync fails, so the NAD is requeued only if it was synced;
+			// a failure must be retried by the worker, not fail the start of
+			// the controller
+			nc.syncFilteredNADs()
+
+			g.Eventually(reconciled, time.Second).Should(gomega.Receive(gomega.Equal(key)),
+				"the NAD must be synced, and requeued when its sync fails")
+		})
+	}
 }
